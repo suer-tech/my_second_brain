@@ -14,6 +14,7 @@
 """
 
 import os
+import shutil
 import uuid as _uuid
 import logging
 from typing import Optional
@@ -34,6 +35,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 
 MAX_ITERATIONS = 3  # максимальное число циклов Developer→Checker
+MAX_KEPT_SESSIONS = 10  # сколько последних сессий хранить, старые auto-purge
+
+os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 
 def _create_session_dir() -> str:
@@ -42,6 +46,29 @@ def _create_session_dir() -> str:
     session_dir = os.path.join(SESSIONS_DIR, session_id)
     os.makedirs(session_dir, exist_ok=True)
     return session_dir
+
+
+def _purge_old_sessions() -> None:
+    """Удаляет старые сессии, оставляя последние MAX_KEPT_SESSIONS.
+
+    Сортировка по времени модификации (mtime): самые свежие остаются,
+    старые удаляются. Вызывается после создания новой сессии.
+    """
+    try:
+        entries = [
+            (
+                os.path.join(SESSIONS_DIR, d),
+                os.path.getmtime(os.path.join(SESSIONS_DIR, d)),
+            )
+            for d in os.listdir(SESSIONS_DIR)
+            if os.path.isdir(os.path.join(SESSIONS_DIR, d))
+        ]
+        entries.sort(key=lambda x: x[1], reverse=True)  # новые первыми
+        for path, _ in entries[MAX_KEPT_SESSIONS:]:
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("Purged old session: %s", os.path.basename(path))
+    except Exception as e:
+        logger.warning("Session purge failed: %s", e)
 
 
 async def run_planner(task: str, session_dir: str) -> str:
@@ -173,6 +200,7 @@ async def run_orchestrator(task: str) -> str:
     Возвращает финальный отчёт для пользователя.
     """
     session_dir = _create_session_dir()
+    _purge_old_sessions()  # держим только последние MAX_KEPT_SESSIONS
     logger.info("Orchestrator: сессия %s, задача: %s", session_dir, task[:200])
 
     # Snapshot git-состояния ДО задачи — для детерминированного определения
