@@ -1,14 +1,15 @@
 import logging
 import os
 from typing import Optional
+import asyncio
 
 from aiogram import Router, types
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 
 try:
-    # GraphRecursionError доступен в langgraph>=0.2 (фикс №9).
     from langgraph.errors import GraphRecursionError
-except ImportError:  # pragma: no cover - запасной вариант для старых версий
+except ImportError:  # pragma: no cover
 
     class GraphRecursionError(Exception):
         pass
@@ -85,9 +86,19 @@ async def process_message(message: types.Message):
     # Отправляем сообщение-плейсхолдер
     processing_msg = await message.answer("Принято! Обрабатываю граф...")
 
+    # Progress callback: отправляет отдельное сообщение при каждом переключении агента.
+    async def send_progress(step: str, detail: str):
+        try:
+            await message.answer(f"<b>{step}</b>\n{detail}", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    # Пробрасываем колбэк в code_loop через модульный глобал (single-user бот,
+    # конкурентных запросов нет, поэтому thread-безопасность не нужна).
+    from src.agent import code_loop
+
+    code_loop._active_progress = send_progress
     try:
-        # Вызываем граф асинхронно. recursion_limit в config ограничивает
-        # число шагов ReAct-цикла qa_pro <-> tools (фикс №9).
         result = await graph.ainvoke(
             {"input_content": text},
             config={"recursion_limit": REACT_RECURSION_LIMIT},
@@ -109,3 +120,5 @@ async def process_message(message: types.Message):
         await processing_msg.edit_text(
             f"Произошла ошибка при выполнении графа: {str(e)}"
         )
+    finally:
+        code_loop._active_progress = None

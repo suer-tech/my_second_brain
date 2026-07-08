@@ -1,9 +1,8 @@
 import json
 import uuid as _uuid
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, add_messages
 from typing import TypedDict, Optional, Literal, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langgraph.graph import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from src.agent.llm_router import get_flash_llm, get_pro_llm
@@ -331,7 +330,11 @@ async def qa_pro_node(state: AgentState) -> dict:
 
 
 async def orchestrator_node(state: AgentState) -> dict:
-    """Оркестратор: координирует Planner → Developer → Checker с циклом."""
+    """Оркестратор: Planner → Developer → Checker с циклом.
+
+    progress-колбэк пробрасывается через модульный глобал
+    code_loop._active_progress (single-user бот).
+    """
     task = state["input_content"]
     result = await run_orchestrator(task)
     return {"final_response": result}
