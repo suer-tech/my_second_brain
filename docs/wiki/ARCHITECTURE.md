@@ -19,26 +19,59 @@
    - `SQLite/PostgreSQL` — для хранения состояния (Checkpointers) LangGraph.
 
 ## Поток данных (Data Flow)
-1. Пользователь присылает ссылку/текст в Telegram.
-2. `aiogram` хендлер перехватывает сообщение, валидирует `ALLOWED_TELEGRAM_ID` (фикс №7) и инициирует LangGraph задачу с `recursion_limit` в config (фикс №9).
-3. Узел `analyze_context` читает профиль пользователя и **классифицирует намерение** через LLM (opencode → router_ai): `INGEST` (статья/ссылка) или `QA` (вопрос/команда). Условное ребро `route_intent` направляет в соответствующую ветку.
-4. **Ветка Ingest**:
-   - `save_raw`: асинхронно (aiohttp) скачивает контент по URL, возвращает `None` при ошибке и прерывает ветку с человекочитаемым ответом. Сохраняет оригинал в `raw/`.
-   - `extract_flash`: LLM (opencode → router_ai) извлекает факты с учётом профиля пользователя.
-   - `compile_pro`: LLM формирует Markdown-статью и сохраняет в `wiki/` под уникальным именем (uuid-суффикс).
-5. **Ветка QA**:
-   - `update_memory`: LLM анализирует сообщение на предмет новых целей/опыта и обновляет `wiki/user_knowledge_map.md`.
-   - `qa_pro`: LLM (router_ai для tool-calling) с привязанными tools (терминал, файлы) отвечает пользователю, опираясь на Wiki-контекст (с ограничением размера). Реализован ReAct-цикл с условным ребром `tools_condition` к узлу `tools` и обратно.
-6. Пользователь уведомляется финальным ответом.
+1. Пользователь присылает ссылку/текст/команду в Telegram.
+2. `aiogram` хендлер перехватывает сообщение, валидирует `ALLOWED_TELEGRAM_ID` и инициирует LangGraph задачу.
+3. Узел `analyze_context` читает профиль пользователя и **классифицирует намерение** через LLM: `INGEST` (статья/ссылка), `QA` (вопрос) или `CODE_TASK` (модификация кода). Условное ребро `route_intent` направляет в соответствующую ветку.
+4. **Ветка Ingest** (`save_raw` → `extract_flash` → `compile_pro` → END):
+   - `save_raw`: асинхронно (aiohttp) скачивает контент по URL, сохраняет оригинал в `raw/`.
+   - `extract_flash`: LLM извлекает факты + теги (JSON).
+   - `compile_pro`: LLM формирует Markdown-статью, сохраняет в `wiki/`, регистрирует в `schema/index.json` с перекрёстными ссылками.
+5. **Ветка QA** (`update_memory` → `qa_pro` ↔ `qa_tools` → END):
+   - `update_memory`: LLM извлекает личные данные и категоризует в `memory/`.
+   - `qa_pro`: LLM с **read-only tools** (read_file, list_directory) отвечает на основе Wiki + памяти. **Прямое редактирование кода через write_file/edit/bash ЗАПРЕЩЕНО**.
+6. **Ветка CODE_TASK** (`orchestrator` → END):
+   - Запускается агентный луп из `src/agent/code_loop.py`.
+   - **Orchestrator** координирует цикл: Planner → Developer → Checker.
+   - **Planner**: изучает задачу, составляет план, сохраняет в `sessions/{id}/plan.md`.
+   - **Developer**: следует плану, вносит правки в код через tools (write_file, bash и т.д.).
+   - **Checker**: пишет тесты, тестирует код. Если тесты упали — цикл повторяется (Developer → Checker).
+   - Максимум 3 итерации, после чего возвращается отчёт.
+7. Пользователь уведомляется финальным ответом.
 
 ## Асинхронность и провайдеры LLM
 Весь стек ввода-вывода переведён в `async` в соответствии с `AGENT_RULES.md`:
 - Узлы графа — `async def`, LLM вызываются через `await llm.ainvoke(...)`.
-- **opencode CLI** вызывается через `asyncio.create_subprocess_exec` с таймаутом 120с.
+- **opencode CLI** вызывается через `asyncio.create_subprocess_shell` с таймаутом 120с. Путь к бинарнику — через `OPENCODE_BIN` env var (для VPS/Ubuntu).
 - **router_ai** (OpenAI-совместимый) — через `langchain_openai.ChatOpenAI` с `await llm.ainvoke(...)`.
 - Загрузка URL — `aiohttp`.
 - Выполнение shell-команд в tools — `asyncio.create_subprocess_shell` с таймаутом.
 - Веб-поиск (DuckDuckGo) — `asyncio.to_thread`.
+
+## Агентный луп модификации кода
+Реализован в `src/agent/code_loop.py`. Используется, когда пользователь просит внести правки в код.
+
+```
+Orchestrator
+    │
+    ▼
+  Planner ──→ plan.md
+    │
+    ▼
+  Developer ──→ правки в коде (через tools)
+    │
+    ▼
+  Checker ──→ тесты
+    │
+    ├── TESTS_PASSED ──→ результат пользователю
+    │
+    └── TESTS_FAILED ──→ обратно к Developer (цикл, макс. 3 итерации)
+```
+
+**Правила безопасности:**
+- Прямое редактирование кода через `write_file`/`edit`/`bash` в Q&A-ветке **ЗАПРЕЩЕНО**.
+- Q&A-ветка имеет только read-only tools (`read_file`, `list_directory`).
+- Все правки кода идут исключительно через агентный луп (Developer agent).
+- Исключение — `.md`-документация (можно редактировать напрямую).
 
 ## Ключевые сценарии использования (Use Cases)
 

@@ -11,6 +11,7 @@ venv.bak/
 raw/*.txt
 wiki/Article_*.md
 schema/index.json
+sessions/
 
 # Python
 __pycache__/

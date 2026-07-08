@@ -84,3 +84,7 @@ async def list_directory(path: str = ".") -> str:
 
 # Экспортируем список для LangGraph
 developer_tools = [execute_bash_command, read_file, write_file, list_directory]
+
+# Read-only tools для Q&A-ветки: прямой запуск/редактирование кода запрещён,
+# но агент может читать файлы и листать директории для контекста.
+qa_readonly_tools = [read_file, list_directory]

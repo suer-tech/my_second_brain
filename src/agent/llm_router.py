@@ -44,9 +44,11 @@ async def _call_opencode(messages: list[BaseMessage]) -> str:
 
     Кросс-платформенный запуск: на Windows opencode — это .CMD-файл,
     требующий shell-mode; на Linux/Mac — прямой executable.
+    Путь к бинарнику задаётся через OPENCODE_BIN (для VPS/Ubuntu).
     """
     prompt = _messages_to_prompt(messages)
-    args = ["opencode", "run", "-m", OPENCODE_MODEL, prompt, "--format", "json"]
+    opencode_bin = os.getenv("OPENCODE_BIN", "opencode")
+    args = [opencode_bin, "run", "-m", OPENCODE_MODEL, prompt, "--format", "json"]
 
     if sys.platform == "win32":
         # Windows: .CMD-файлы не запускаются через create_subprocess_exec.

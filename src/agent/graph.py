@@ -18,15 +18,16 @@ from src.agent.utils import (
     update_memory,
 )
 from src.agent import schema as schema_manager
-from src.agent.tools import developer_tools
+from src.agent.tools import qa_readonly_tools
+from src.agent.code_loop import run_orchestrator
 
-# Лимит рекурсии ReAct-цикла qa_pro <-> tools (фикс №9).
+# Лимит рекурсии ReAct-цикла qa_pro <-> tools.
 REACT_RECURSION_LIMIT = 10
 
 
 class AgentState(TypedDict):
     input_content: str
-    input_type: Optional[Literal["ingest", "qa"]]
+    input_type: Optional[Literal["ingest", "qa", "code_task"]]
     user_profile: Optional[str]
     raw_data_path: Optional[str]
     source_url: Optional[str]
@@ -38,35 +39,61 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-def _heuristic_classify(content: str) -> Literal["ingest", "qa"]:
+# Ключевые слова, указывающие на задачу модификации кода.
+_CODE_TASK_TRIGGERS = [
+    "добавь",
+    "исправь",
+    "поправь",
+    "перепиши",
+    "рефактор",
+    "refactor",
+    "создай проект",
+    "создай файл",
+    "измени код",
+    "обнови код",
+    "fix",
+    "add feature",
+    "implement",
+    "разработай",
+    "модифицируй",
+]
+
+
+def _heuristic_classify(content: str) -> Literal["ingest", "qa", "code_task"]:
     """Резервная классификация при недоступности LLM."""
     if is_url(content):
         return "ingest"
+    content_lower = content.lower()
+    if any(trigger in content_lower for trigger in _CODE_TASK_TRIGGERS):
+        return "code_task"
     if len(content) > 2000 and "?" not in content:
         return "ingest"
     return "qa"
 
 
 async def analyze_context_node(state: AgentState) -> dict:
-    """Reads profile, classifies intent (URL/article vs Question/Command)."""
+    """Классифицирует намерение: INGEST / QA / CODE_TASK."""
     profile = read_user_profile()
     content = state["input_content"].strip()
 
-    input_type: Literal["ingest", "qa"] = _heuristic_classify(content)
+    input_type: Literal["ingest", "qa", "code_task"] = _heuristic_classify(content)
     try:
         llm = get_flash_llm()
         sys_msg = SystemMessage(
             content=(
                 "You are an intent classifier for a personal AI knowledge agent. "
-                "Classify the user's input into one of two categories. Output EXACTLY one word:\n"
+                "Classify the user's input into one of THREE categories. Output EXACTLY one word:\n"
                 "- INGEST: URL, article, research paper, or long document to save.\n"
-                "- QA: question, command, or short conversational message."
+                "- QA: question, command, or short conversational message.\n"
+                "- CODE_TASK: request to modify, create, fix, or refactor code in the project."
             )
         )
         user_msg = HumanMessage(content=content[:4000])
         decision = str((await llm.ainvoke([sys_msg, user_msg])).content).strip().upper()
         if "INGEST" in decision:
             input_type = "ingest"
+        elif "CODE" in decision or "TASK" in decision:
+            input_type = "code_task"
         elif "QA" in decision:
             input_type = "qa"
     except Exception:
@@ -79,10 +106,17 @@ async def analyze_context_node(state: AgentState) -> dict:
     }
 
 
-def route_intent(state: AgentState) -> Literal["save_raw", "update_memory"]:
+def route_intent(
+    state: AgentState,
+) -> Literal["save_raw", "update_memory", "orchestrator"]:
     if state["input_type"] == "ingest":
         return "save_raw"
+    if state["input_type"] == "code_task":
+        return "orchestrator"
     return "update_memory"
+
+
+# ─── Ветка INGEST ───────────────────────────────────────────────────────────
 
 
 async def save_raw_node(state: AgentState) -> dict:
@@ -105,7 +139,6 @@ async def save_raw_node(state: AgentState) -> dict:
 
 
 async def extract_flash_node(state: AgentState) -> dict:
-    """Извлекает факты и теги из raw-текста."""
     if state.get("error") or state.get("final_response"):
         return {}
 
@@ -127,11 +160,9 @@ async def extract_flash_node(state: AgentState) -> dict:
     response = await llm.ainvoke([sys_msg, user_msg])
     raw = str(response.content).strip()
 
-    # Парсим JSON-ответ (с fallback на весь текст как summary).
     summary = raw
-    tags: list[str] = []
+    tags: list = []
     try:
-        # Извлекаем JSON из ответа (модель может обернуть в ```json ... ```).
         json_str = raw
         if "```" in raw:
             start = raw.find("{")
@@ -148,7 +179,6 @@ async def extract_flash_node(state: AgentState) -> dict:
 
 
 async def compile_pro_node(state: AgentState) -> dict:
-    """Компилирует wiki-статью, сохраняет в схему с тегами и перекрёстными ссылками."""
     if state.get("error") or state.get("final_response"):
         return {}
 
@@ -157,7 +187,6 @@ async def compile_pro_node(state: AgentState) -> dict:
     profile = state["user_profile"]
     tags: list = list(state.get("extracted_tags") or [])
 
-    # Находим связанные статьи по тегам ДО генерации, чтобы включить их в промпт.
     related = schema_manager.find_related(tags, limit=5)
     related_context = ""
     if related:
@@ -169,7 +198,7 @@ async def compile_pro_node(state: AgentState) -> dict:
     sys_msg = SystemMessage(
         content=(
             f"You are a Senior AI Architect building a Wiki for a user with this profile:\n{profile}\n"
-            f"Based on the extracted summary, create a comprehensive Markdown article. "
+            "Based on the extracted summary, create a comprehensive Markdown article. "
             "FORMAT: Start with a short Business Summary (value, cost, use-case), "
             "then Technical Architecture (Mermaid diagrams if applicable)."
             f"{related_context}"
@@ -180,14 +209,12 @@ async def compile_pro_node(state: AgentState) -> dict:
     response = await llm.ainvoke([sys_msg, user_msg])
     wiki_content = str(response.content)
 
-    # Генерируем заголовок из первых слов summary.
     title = summary[:60].strip().split("\n")[0] or f"Article_{_uuid.uuid4().hex[:8]}"
     wiki_path = save_wiki_file(title, wiki_content)
     raw_path = state.get("raw_data_path") or ""
     source_url = state.get("source_url")
     one_line_summary = summary[:200].replace("\n", " ")
 
-    # Добавляем запись в схему (перекрёстные ссылки вычисляются автоматически).
     article_id = schema_manager.add_article(
         raw_file=raw_path,
         wiki_file=wiki_path,
@@ -197,7 +224,6 @@ async def compile_pro_node(state: AgentState) -> dict:
         source_url=source_url,
     )
 
-    # Дописываем секцию «Связанные материалы» в wiki-файл.
     if related:
         links_md = "\n\n## Связанные материалы\n"
         for a in related:
@@ -214,6 +240,9 @@ async def compile_pro_node(state: AgentState) -> dict:
             f"Краткое ревью:\n{wiki_content[:500]}..."
         )
     }
+
+
+# ─── Ветка QA ──────────────────────────────────────────────────────────────
 
 
 async def update_memory_node(state: AgentState) -> dict:
@@ -260,8 +289,13 @@ async def update_memory_node(state: AgentState) -> dict:
 
 
 async def qa_pro_node(state: AgentState) -> dict:
-    """Q&A с привязанными tools, опираясь на Wiki + личную память пользователя."""
-    llm = get_pro_llm().bind_tools(developer_tools)
+    """Q&A с read-only tools. Прямое редактирование кода ЗАПРЕЩЕНО.
+
+    Пользователь может задавать вопросы и получать ответы на основе Wiki,
+    памяти и read-only доступа к файловой системе. Для правок кода
+    используется отдельная ветка CODE_TASK (агентный луп).
+    """
+    llm = get_pro_llm().bind_tools(qa_readonly_tools)
     profile = state.get("user_profile") or ""
     wiki_context = read_all_wiki()
     memory_context = read_all_memory()
@@ -269,13 +303,17 @@ async def qa_pro_node(state: AgentState) -> dict:
 
     sys_msg = SystemMessage(
         content=(
-            "Ты — Autonomous AI Developer и боевой товарищ пользователя. "
-            "Общайся на «ты», как опытный коллега. Дружеский тон, но серьёзен в архитектуре и девопсе.\n\n"
+            "Ты — ИИ-ассистент и боевой товарищ пользователя. "
+            "Общайся на «ты», как опытный коллега. Дружеский тон, но серьёзен в архитектуре.\n\n"
             f"User profile:\n{profile}\n\n"
             f"Wiki Knowledge Base:\n{wiki_context}\n\n"
             f"Personal Memory (копия пользователя):\n{memory_context}\n\n"
-            "У тебя есть доступ к терминалу и файловой системе через tools. "
-            "Если пользователь просит создать проект или запустить код — ДЕЛАЙ ЭТО."
+            "У тебя есть read-only доступ к файловой системе (read_file, list_directory). "
+            "ВНИМАНИЕ: Прямое редактирование кода через write_file/edit/bash ЗАПРЕЩЕНО. "
+            "Если пользователь просит внести правки в код — скажи ему, что для этого "
+            "нужно отправить запрос на модификацию, и он будет обработан через "
+            "агентный луп (Planner → Developer → Checker). "
+            "Исключение — только .md-документация."
         )
     )
 
@@ -289,26 +327,52 @@ async def qa_pro_node(state: AgentState) -> dict:
     return {"messages": [response], "final_response": final_text}
 
 
+# ─── Ветка CODE_TASK (агентный луп) ─────────────────────────────────────────
+
+
+async def orchestrator_node(state: AgentState) -> dict:
+    """Оркестратор: координирует Planner → Developer → Checker с циклом."""
+    task = state["input_content"]
+    result = await run_orchestrator(task)
+    return {"final_response": result}
+
+
+# ─── Сборка графа ───────────────────────────────────────────────────────────
+
+
 def build_graph():
     workflow = StateGraph(AgentState)
 
+    # Общий
     workflow.add_node("analyze_context", analyze_context_node)
+
+    # Ветка INGEST
     workflow.add_node("save_raw", save_raw_node)
     workflow.add_node("extract_flash", extract_flash_node)
     workflow.add_node("compile_pro", compile_pro_node)
+
+    # Ветка QA
     workflow.add_node("update_memory", update_memory_node)
     workflow.add_node("qa_pro", qa_pro_node)
-    workflow.add_node("tools", ToolNode(developer_tools))
+    workflow.add_node("tools", ToolNode(qa_readonly_tools))
+
+    # Ветка CODE_TASK
+    workflow.add_node("orchestrator", orchestrator_node)
 
     workflow.set_entry_point("analyze_context")
     workflow.add_conditional_edges("analyze_context", route_intent)
 
+    # INGEST: save_raw → extract_flash → compile_pro → END
     workflow.add_edge("save_raw", "extract_flash")
     workflow.add_edge("extract_flash", "compile_pro")
     workflow.add_edge("compile_pro", END)
 
+    # QA: update_memory → qa_pro ↔ tools → END
     workflow.add_edge("update_memory", "qa_pro")
     workflow.add_conditional_edges("qa_pro", tools_condition)
     workflow.add_edge("tools", "qa_pro")
+
+    # CODE_TASK: orchestrator → END
+    workflow.add_edge("orchestrator", END)
 
     return workflow.compile()
