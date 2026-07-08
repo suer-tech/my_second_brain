@@ -22,6 +22,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agent.llm_router import get_pro_llm
 from src.agent.tools import developer_tools
+from src.agent.docs_sync import (
+    capture_git_snapshot,
+    get_task_changed_files,
+    sync_documentation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +175,10 @@ async def run_orchestrator(task: str) -> str:
     session_dir = _create_session_dir()
     logger.info("Orchestrator: сессия %s, задача: %s", session_dir, task[:200])
 
+    # Snapshot git-состояния ДО задачи — для детерминированного определения
+    # изменённых файлов (актуализация документации после завершения).
+    git_before = await capture_git_snapshot()
+
     # Шаг 1: Planner
     plan_path = await run_planner(task, session_dir)
 
@@ -177,7 +186,10 @@ async def run_orchestrator(task: str) -> str:
     feedback: Optional[str] = None
     dev_report = ""
     checker_feedback = ""
+    success = False
+    iterations_used = 0
     for iteration in range(1, MAX_ITERATIONS + 1):
+        iterations_used = iteration
         logger.info("Orchestrator: итерация %d", iteration)
 
         # Developer
@@ -187,16 +199,38 @@ async def run_orchestrator(task: str) -> str:
         success, checker_feedback = await run_checker(task, plan_path)
 
         if success:
-            return (
-                f"✅ Задача выполнена успешно!\n\n"
-                f"Сессия: {session_dir}\n"
-                f"План: {plan_path}\n"
-                f"Итераций: {iteration}\n\n"
-                f"Отчёт разработчика:\n{dev_report[:500]}"
-            )
+            break
         else:
             feedback = checker_feedback
             logger.warning("Orchestrator: итерация %d провалена, повтор", iteration)
+
+    # Актуализация документации ДО ответа пользователю.
+    # Git diff (after \ before) даёт точный список файлов, изменённых задачей.
+    docs_report = ""
+    try:
+        changed = await get_task_changed_files(git_before)
+        if changed:
+            logger.info(
+                "Orchestrator: изменено файлов %d, запускаю docs sync", len(changed)
+            )
+            sync_result = await sync_documentation(changed)
+            if sync_result:
+                docs_report = (
+                    f"\n\n📚 [Документация актуализирована]:\n{sync_result[:400]}"
+                )
+    except Exception as e:
+        logger.warning("Orchestrator: docs sync failed: %s", e)
+
+    # Формируем финальный ответ.
+    if success:
+        return (
+            f"✅ Задача выполнена успешно!\n\n"
+            f"Сессия: {session_dir}\n"
+            f"План: {plan_path}\n"
+            f"Итераций: {iterations_used}\n\n"
+            f"Отчёт разработчика:\n{dev_report[:500]}"
+            f"{docs_report}"
+        )
 
     # Исчерпали лимит итераций
     return (
@@ -205,4 +239,5 @@ async def run_orchestrator(task: str) -> str:
         f"План: {plan_path}\n\n"
         f"Последний отчёт разработчика:\n{dev_report[:500]}\n\n"
         f"Последний feedback тестировщика:\n{checker_feedback[:500]}"
+        f"{docs_report}"
     )
