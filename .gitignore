@@ -2,10 +2,15 @@
 .env
 .venv
 env/
-venv/
+venv
 ENV/
 env.bak/
 venv.bak/
+
+# Runtime data (Second Brain storage)
+raw/*.txt
+wiki/Article_*.md
+schema/index.json
 
 # Python
 __pycache__/

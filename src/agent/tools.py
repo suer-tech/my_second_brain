@@ -1,5 +1,5 @@
 import os
-import subprocess
+import asyncio
 from langchain_core.tools import tool
 from src.agent.security import review_bash_command
 
@@ -7,32 +7,44 @@ from src.agent.security import review_bash_command
 # Но по умолчанию его корень — это корень агента
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
+
 @tool
-def execute_bash_command(command: str) -> str:
+async def execute_bash_command(command: str) -> str:
     """Executes a bash/powershell command on the host system. Use this to run npm, python, git, or other CLI tools. Returns stdout and stderr."""
-    # 1. Проверка безопасности (Security Agent Interceptor)
-    is_safe, reason = review_bash_command(command)
+    # 1. Проверка безопасности (Security Agent Interceptor).
+    # review_bash_command асинхронна: внутри может звать LLM и веб-поиск
+    # через asyncio.to_thread, не блокируя event loop (фикс №8).
+    is_safe, reason = await review_bash_command(command)
     if not is_safe:
         return f"SECURITY AGENT BLOCKED COMMAND: {reason}\nWARNING: Do not attempt to run this command again."
 
     try:
-        result = subprocess.run(
+        # Асинхронный subprocess вместо блокирующего subprocess.run (фикс №8).
+        proc = await asyncio.create_subprocess_shell(
             command,
-            shell=True,
             cwd=ROOT_DIR,
-            capture_output=True,
-            text=True,
-            timeout=120
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        output = result.stdout
-        if result.stderr:
-            output += f"\nSTDERR:\n{result.stderr}"
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=120
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "Error: command timed out after 120 seconds."
+        output = stdout_bytes.decode("utf-8", errors="ignore")
+        stderr = stderr_bytes.decode("utf-8", errors="ignore")
+        if stderr:
+            output += f"\nSTDERR:\n{stderr}"
         return output if output else "Command executed successfully with no output."
     except Exception as e:
         return f"Error executing command: {str(e)}"
 
+
 @tool
-def read_file(path: str) -> str:
+async def read_file(path: str) -> str:
     """Reads the contents of a file. Provide the path relative to the project root, or an absolute path."""
     target_path = path if os.path.isabs(path) else os.path.join(ROOT_DIR, path)
     if not os.path.exists(target_path):
@@ -43,8 +55,9 @@ def read_file(path: str) -> str:
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
+
 @tool
-def write_file(path: str, content: str) -> str:
+async def write_file(path: str, content: str) -> str:
     """Writes content to a file. Overwrites if exists, creates if it doesn't. Will create directories if needed."""
     target_path = path if os.path.isabs(path) else os.path.join(ROOT_DIR, path)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -55,8 +68,9 @@ def write_file(path: str, content: str) -> str:
     except Exception as e:
         return f"Error writing file: {str(e)}"
 
+
 @tool
-def list_directory(path: str = ".") -> str:
+async def list_directory(path: str = ".") -> str:
     """Lists the contents of a directory. Path is relative to project root. Returns files and folders."""
     target_path = path if os.path.isabs(path) else os.path.join(ROOT_DIR, path)
     if not os.path.exists(target_path):
@@ -66,6 +80,7 @@ def list_directory(path: str = ".") -> str:
         return "\n".join(items) if items else "Directory is empty."
     except Exception as e:
         return f"Error listing directory: {str(e)}"
+
 
 # Экспортируем список для LangGraph
 developer_tools = [execute_bash_command, read_file, write_file, list_directory]
