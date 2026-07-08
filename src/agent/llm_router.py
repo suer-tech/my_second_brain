@@ -8,6 +8,8 @@ import subprocess
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 
+from src.agent.logger import log_llm_call, get_session_id, _now_ms as _log_now_ms
+
 logger = logging.getLogger(__name__)
 
 # ─── Провайдер 1: opencode CLI (ОСНОВНОЙ, бесплатный) ──────────────────────
@@ -123,22 +125,51 @@ class UnifiedLLM:
 
     async def ainvoke(self, messages, **kwargs):
         messages = list(messages)
+        session_id = get_session_id() or ""
+        t0 = _log_now_ms()
+
+        prompt_len = sum(len(str(m.content)) for m in messages)
 
         # Tool-calling доступен только через router_ai (OpenAI-совместимый API).
         if self._tools:
             llm = _get_routerai_llm().bind_tools(self._tools)
-            return await llm.ainvoke(messages)
+            result = await llm.ainvoke(messages)
+            response_len = len(str(result.content))
+            if session_id:
+                log_llm_call(
+                    session_id,
+                    ROUTERAI_MODEL,
+                    prompt_len,
+                    response_len,
+                    _log_now_ms() - t0,
+                )
+            return result
 
         # Без инструментов: сначала opencode CLI.
         try:
             content = await _call_opencode(messages)
+            response_len = len(content)
+            if session_id:
+                log_llm_call(
+                    session_id,
+                    OPENCODE_MODEL,
+                    prompt_len,
+                    response_len,
+                    _log_now_ms() - t0,
+                )
             return AIMessage(content=content)
         except Exception as e:
             logger.warning("opencode CLI недоступен, откат на router_ai: %s", e)
 
         # Fallback: router_ai.
         llm = _get_routerai_llm()
-        return await llm.ainvoke(messages)
+        result = await llm.ainvoke(messages)
+        response_len = len(str(result.content))
+        if session_id:
+            log_llm_call(
+                session_id, ROUTERAI_MODEL, prompt_len, response_len, _log_now_ms() - t0
+            )
+        return result
 
 
 def get_flash_llm() -> UnifiedLLM:

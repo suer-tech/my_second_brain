@@ -13,6 +13,7 @@ wiki/Article_*.md
 schema/index.json
 sessions/
 history/
+logs/
 
 # Python
 __pycache__/

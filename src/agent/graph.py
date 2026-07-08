@@ -1,7 +1,7 @@
 import json
 import uuid as _uuid
 from langgraph.graph import StateGraph, END, add_messages
-from typing import TypedDict, Optional, Literal, Annotated, Sequence
+from typing import TypedDict, Optional, Literal, Annotated, Sequence, cast
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -20,6 +20,15 @@ from src.agent import schema as schema_manager
 from src.agent.tools import qa_readonly_tools
 from src.agent.code_loop import run_orchestrator
 from src.agent.history import format_history_for_prompt, save_exchange
+from src.agent.logger import (
+    log_node_start,
+    log_node_end,
+    log_classifier,
+    log_routing,
+    get_session_id,
+    set_session_id,
+    _now_ms as _log_now_ms,
+)
 
 # Лимит рекурсии ReAct-цикла qa_pro <-> tools.
 REACT_RECURSION_LIMIT = 10
@@ -77,9 +86,14 @@ def _heuristic_classify(content: str) -> Literal["ingest", "qa", "code_task"]:
 
 async def analyze_context_node(state: AgentState) -> dict:
     """Классифицирует намерение: INGEST / QA / CODE_TASK."""
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "analyze_context", branch="classifier")
+
     profile = read_user_profile()
     content = state["input_content"].strip()
 
+    t0 = _log_now_ms()
+    heuristic = True
     input_type: Literal["ingest", "qa", "code_task"] = _heuristic_classify(content)
     try:
         llm = get_flash_llm()
@@ -100,8 +114,21 @@ async def analyze_context_node(state: AgentState) -> dict:
             input_type = "code_task"
         elif "QA" in decision:
             input_type = "qa"
+        heuristic = False
     except Exception:
         pass
+
+    duration = _log_now_ms() - t0
+    log_classifier(
+        session_id, content[:100], input_type, heuristic=heuristic, duration_ms=duration
+    )
+    log_node_end(
+        session_id,
+        "analyze_context",
+        start_ms,
+        branch="classifier",
+        data={"decision": input_type},
+    )
 
     return {
         "user_profile": profile,
@@ -112,18 +139,22 @@ async def analyze_context_node(state: AgentState) -> dict:
 
 def route_intent(
     state: AgentState,
-) -> Literal["save_raw", "update_memory", "orchestrator"]:
-    if state["input_type"] == "ingest":
-        return "save_raw"
-    if state["input_type"] == "code_task":
-        return "orchestrator"
-    return "update_memory"
+) -> str:
+    session_id = get_session_id() or "unknown"
+    raw_type = state.get("input_type")
+    input_type: str = raw_type if raw_type is not None else "qa"
+    targets: dict = {"ingest": "save_raw", "code_task": "orchestrator"}
+    target: str = targets.get(input_type, "update_memory")
+    log_routing(session_id, input_type, target)
+    return target
 
 
 # ─── Ветка INGEST ───────────────────────────────────────────────────────────
 
 
 async def save_raw_node(state: AgentState) -> dict:
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "save_raw", branch="ingest")
     content = state["input_content"]
     source_url: Optional[str] = None
 
@@ -131,6 +162,14 @@ async def save_raw_node(state: AgentState) -> dict:
         source_url = content
         text = await fetch_url_text(content)
         if not text:
+            log_node_end(
+                session_id,
+                "save_raw",
+                start_ms,
+                branch="ingest",
+                status="error",
+                data={"error": "fetch_url_failed"},
+            )
             return {
                 "final_response": "Не удалось загрузить или извлечь текст по ссылке. Проверь URL.",
                 "error": "fetch_url_failed",
@@ -139,11 +178,23 @@ async def save_raw_node(state: AgentState) -> dict:
         text = content
 
     path = save_raw_file(text)
+    log_node_end(
+        session_id,
+        "save_raw",
+        start_ms,
+        branch="ingest",
+        data={"raw_path": path, "is_url": bool(source_url)},
+    )
     return {"raw_data_path": path, "input_content": text, "source_url": source_url}
 
 
 async def extract_flash_node(state: AgentState) -> dict:
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "extract_flash", branch="ingest")
     if state.get("error") or state.get("final_response"):
+        log_node_end(
+            session_id, "extract_flash", start_ms, branch="ingest", status="skipped"
+        )
         return {}
 
     llm = get_flash_llm()
@@ -179,11 +230,23 @@ async def extract_flash_node(state: AgentState) -> dict:
     except (json.JSONDecodeError, ValueError):
         pass
 
+    log_node_end(
+        session_id,
+        "extract_flash",
+        start_ms,
+        branch="ingest",
+        data={"tags_count": len(tags), "summary_len": len(summary)},
+    )
     return {"extracted_summary": summary, "extracted_tags": tags}
 
 
 async def compile_pro_node(state: AgentState) -> dict:
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "compile_pro", branch="ingest")
     if state.get("error") or state.get("final_response"):
+        log_node_end(
+            session_id, "compile_pro", start_ms, branch="ingest", status="skipped"
+        )
         return {}
 
     llm = get_pro_llm()
@@ -235,6 +298,19 @@ async def compile_pro_node(state: AgentState) -> dict:
         with open(wiki_path, "a", encoding="utf-8") as f:
             f.write(links_md)
 
+    log_node_end(
+        session_id,
+        "compile_pro",
+        start_ms,
+        branch="ingest",
+        data={
+            "wiki_path": wiki_path,
+            "article_id": article_id,
+            "tags": tags,
+            "related_count": len(related),
+        },
+    )
+
     return {
         "final_response": (
             f"Статья сохранена в Wiki: {wiki_path}\n"
@@ -251,6 +327,8 @@ async def compile_pro_node(state: AgentState) -> dict:
 
 async def update_memory_node(state: AgentState) -> dict:
     """Анализирует сообщение, извлекает личные данные и категоризует в memory/."""
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "update_memory", branch="qa")
     llm = get_flash_llm()
     question = state["input_content"]
 
@@ -289,6 +367,13 @@ async def update_memory_node(state: AgentState) -> dict:
     if category and extracted:
         update_memory(category, extracted)
 
+    log_node_end(
+        session_id,
+        "update_memory",
+        start_ms,
+        branch="qa",
+        data={"category": category, "extracted": bool(extracted)},
+    )
     return {"extracted_goals": extracted if extracted else None}
 
 
@@ -298,6 +383,8 @@ async def qa_pro_node(state: AgentState) -> dict:
     Прямое редактирование кода ЗАПРЕЩЕНО. Для правок кода используется
     отдельная ветка CODE_TASK (агентный луп).
     """
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "qa_pro", branch="qa")
     llm = get_pro_llm().bind_tools(qa_readonly_tools)
     profile = state.get("user_profile") or ""
     wiki_context = read_all_wiki()
@@ -337,6 +424,13 @@ async def qa_pro_node(state: AgentState) -> dict:
     if chat_id and final_text:
         save_exchange(chat_id, user_msg, final_text)
 
+    log_node_end(
+        session_id,
+        "qa_pro",
+        start_ms,
+        branch="qa",
+        data={"response_len": len(final_text)},
+    )
     return {"messages": [response], "final_response": final_text}
 
 
@@ -349,8 +443,17 @@ async def orchestrator_node(state: AgentState) -> dict:
     progress-колбэк пробрасывается через модульный глобал
     code_loop._active_progress (single-user бот).
     """
+    session_id = get_session_id() or "unknown"
+    start_ms = log_node_start(session_id, "orchestrator", branch="code_task")
     task = state["input_content"]
     result = await run_orchestrator(task)
+    log_node_end(
+        session_id,
+        "orchestrator",
+        start_ms,
+        branch="code_task",
+        data={"response_len": len(result)},
+    )
     return {"final_response": result}
 
 

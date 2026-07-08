@@ -33,6 +33,13 @@ from src.agent.docs_sync import (
     get_task_changed_files,
     sync_documentation,
 )
+from src.agent.logger import (
+    log_node_start,
+    log_node_end,
+    log_llm_call,
+    log_tool_call,
+    _now_ms as _log_now_ms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +93,8 @@ async def _run_with_tools(
     tools: list,
     tool_counter: Counter,
     max_iters: int = MAX_TOOL_ITERS,
+    session_id: str = "",
+    node_name: str = "",
 ) -> str:
     """Выполняет LLM с инструментами в цикле (ReAct) до получения текстового ответа.
 
@@ -96,10 +105,21 @@ async def _run_with_tools(
         HumanMessage(content=user_prompt),
     ]
     llm_with_tools = llm.bind_tools(tools)
+    model_name = getattr(llm, "_model", "pro")
 
     for _ in range(max_iters):
+        t0 = _log_now_ms()
         response = await llm_with_tools.ainvoke(messages)
+        llm_ms = _log_now_ms() - t0
+
         messages.append(response)
+
+        prompt_len = sum(len(str(m.content)) for m in messages[:-1])
+        response_len = len(str(response.content))
+        if session_id:
+            log_llm_call(
+                session_id, model_name, prompt_len, response_len, llm_ms, node=node_name
+            )
 
         if not response.tool_calls:
             return str(response.content) if response.content else ""
@@ -112,6 +132,7 @@ async def _run_with_tools(
             tool_counter[name] += 1
             logger.debug("Tool call: %s(%s)", name, args)
 
+            t1 = _log_now_ms()
             # Находим тул по имени.
             tool_fn = None
             for t in tools:
@@ -122,10 +143,25 @@ async def _run_with_tools(
             if tool_fn:
                 try:
                     result = await tool_fn.ainvoke(args)
+                    tool_status = "ok"
                 except Exception as e:
                     result = f"Error executing {name}: {e}"
+                    tool_status = "error"
             else:
                 result = f"Unknown tool: {name}"
+                tool_status = "error"
+
+            tool_ms = _log_now_ms() - t1
+            if session_id:
+                log_tool_call(
+                    session_id,
+                    name,
+                    str(args)[:200],
+                    tool_status,
+                    tool_ms,
+                    node=node_name,
+                    result_summary=str(result)[:200],
+                )
 
             tool_results.append(
                 ToolMessage(
@@ -147,8 +183,14 @@ async def run_planner(
     session_dir: str,
     progress: Optional[ProgressCallback] = None,
     tool_counter: Optional[Counter] = None,
+    session_id: str = "",
 ) -> str:
     """Planner: изучает задачу, составляет план, сохраняет в plan.md."""
+    node_name = "planner"
+    start_ms = 0
+    if session_id:
+        start_ms = log_node_start(session_id, node_name, branch="code_task")
+
     llm = get_pro_llm()
     tc = tool_counter or Counter()
 
@@ -179,7 +221,15 @@ async def run_planner(
 
     planner_tools = [read_file, write_file]
 
-    result = await _run_with_tools(llm, system_prompt, user_prompt, planner_tools, tc)
+    result = await _run_with_tools(
+        llm,
+        system_prompt,
+        user_prompt,
+        planner_tools,
+        tc,
+        session_id=session_id,
+        node_name=node_name,
+    )
 
     # Гарантированно сохраняем план.
     plan_path = os.path.join(session_dir, "plan.md")
@@ -191,6 +241,14 @@ async def run_planner(
     if progress:
         await progress("📋 Planner", f"План готов, сохранён в {plan_path}")
 
+    if session_id:
+        log_node_end(
+            session_id,
+            node_name,
+            start_ms,
+            branch="code_task",
+            data={"plan_path": plan_path},
+        )
     return plan_path
 
 
@@ -200,8 +258,19 @@ async def run_developer(
     feedback: Optional[str] = None,
     progress: Optional[ProgressCallback] = None,
     tool_counter: Optional[Counter] = None,
+    session_id: str = "",
 ) -> str:
     """Developer: следует плану, вносит правки в код через ReAct-цикл."""
+    node_name = "developer"
+    start_ms = 0
+    if session_id:
+        start_ms = log_node_start(
+            session_id,
+            node_name,
+            branch="code_task",
+            data={"has_feedback": bool(feedback)},
+        )
+
     llm = get_pro_llm()
     tc = tool_counter or Counter()
 
@@ -233,12 +302,28 @@ async def run_developer(
 
     user_prompt = "Приступай к реализации по плану."
 
-    result = await _run_with_tools(llm, system_prompt, user_prompt, developer_tools, tc)
+    result = await _run_with_tools(
+        llm,
+        system_prompt,
+        user_prompt,
+        developer_tools,
+        tc,
+        session_id=session_id,
+        node_name=node_name,
+    )
 
     logger.info("Developer завершил: %s", result[:200])
     if progress:
         await progress("👨‍💻 Developer", f"Завершил: {result[:150]}")
 
+    if session_id:
+        log_node_end(
+            session_id,
+            node_name,
+            start_ms,
+            branch="code_task",
+            data={"result_len": len(result)},
+        )
     return result
 
 
@@ -247,8 +332,14 @@ async def run_checker(
     plan_path: str,
     progress: Optional[ProgressCallback] = None,
     tool_counter: Optional[Counter] = None,
+    session_id: str = "",
 ) -> tuple[bool, str]:
     """Checker: составляет тесты, тестирует код, возвращает (success, feedback)."""
+    node_name = "checker"
+    start_ms = 0
+    if session_id:
+        start_ms = log_node_start(session_id, node_name, branch="code_task")
+
     llm = get_pro_llm()
     tc = tool_counter or Counter()
 
@@ -274,20 +365,33 @@ async def run_checker(
     )
     user_prompt = "Проверь код и запусти тесты."
 
-    result = await _run_with_tools(llm, system_prompt, user_prompt, developer_tools, tc)
+    result = await _run_with_tools(
+        llm,
+        system_prompt,
+        user_prompt,
+        developer_tools,
+        tc,
+        session_id=session_id,
+        node_name=node_name,
+    )
 
-    if "TESTS_PASSED" in result:
+    passed = "TESTS_PASSED" in result
+    if passed:
         logger.info("Checker: тесты прошли")
         if progress:
             await progress("🧪 Checker", "✅ Все тесты пройдены успешно")
-        return True, ""
     else:
         logger.info("Checker: тесты упали")
         if progress:
             await progress(
                 "🧪 Checker", "❌ Тесты упали, возвращаю Developer'у на доработку"
             )
-        return False, result
+
+    if session_id:
+        log_node_end(
+            session_id, node_name, start_ms, branch="code_task", data={"passed": passed}
+        )
+    return passed, ("" if passed else result)
 
 
 def _format_tool_stats(tool_counter: Counter) -> str:
@@ -303,6 +407,7 @@ def _format_tool_stats(tool_counter: Counter) -> str:
 async def run_orchestrator(
     task: str,
     progress: Optional[ProgressCallback] = None,
+    session_id: str = "",
 ) -> str:
     """Оркестратор — LLM-агент, руководящий Planner/Developer/Checker.
 
@@ -316,6 +421,10 @@ async def run_orchestrator(
         progress = _active_progress
 
     session_dir = _create_session_dir()
+    if not session_id:
+        from src.agent.logger import get_session_id
+
+        session_id = get_session_id() or ""
     _purge_old_sessions()
 
     tool_counter: Counter = Counter()
@@ -340,7 +449,9 @@ async def run_orchestrator(
             await progress(
                 "📋 Planner", "Анализирую задачу, изучаю код проекта, составляю план..."
             )
-        plan_path = await run_planner(task, session_dir, progress, tool_counter)
+        plan_path = await run_planner(
+            task, session_dir, progress, tool_counter, session_id
+        )
         shared["plan_path"] = plan_path
         if progress:
             await progress("📋 Planner", f"План готов: {plan_path}")
@@ -360,7 +471,12 @@ async def run_orchestrator(
         if progress:
             await progress("👨‍💻 Developer", detail)
         report = await run_developer(
-            task, shared["plan_path"], feedback or None, progress, tool_counter
+            task,
+            shared["plan_path"],
+            feedback or None,
+            progress,
+            tool_counter,
+            session_id,
         )
         if progress:
             await progress("👨‍💻 Developer", f"Завершил: {report[:150]}")
@@ -374,7 +490,7 @@ async def run_orchestrator(
         if progress:
             await progress("🧪 Checker", "Пишу тесты и запускаю их...")
         success, feedback = await run_checker(
-            task, shared["plan_path"], progress, tool_counter
+            task, shared["plan_path"], progress, tool_counter, session_id
         )
         shared["feedback"] = feedback
         shared["success"] = success
@@ -427,6 +543,8 @@ async def run_orchestrator(
         orchestrator_tools,
         tool_counter,
         max_iters=MAX_ORCHESTRATOR_ITERS,
+        session_id=session_id,
+        node_name="orchestrator_loop",
     )
 
     # ─── Docs Sync ─────────────────────────────────────────────────────
