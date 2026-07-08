@@ -19,9 +19,14 @@ from src.agent.utils import (
 from src.agent import schema as schema_manager
 from src.agent.tools import qa_readonly_tools
 from src.agent.code_loop import run_orchestrator
+from src.agent.history import format_history_for_prompt, save_exchange
 
 # Лимит рекурсии ReAct-цикла qa_pro <-> tools.
 REACT_RECURSION_LIMIT = 10
+
+# Модульный глобал: chat_id текущего пользователя. Устанавливается из handlers.py
+# перед вызовом графа. Используется в qa_pro_node для загрузки/сохранения истории.
+_active_chat_id: Optional[int] = None
 
 
 class AgentState(TypedDict):
@@ -288,17 +293,20 @@ async def update_memory_node(state: AgentState) -> dict:
 
 
 async def qa_pro_node(state: AgentState) -> dict:
-    """Q&A с read-only tools. Прямое редактирование кода ЗАПРЕЩЕНО.
+    """Q&A с read-only tools и историей последних 3 сообщений.
 
-    Пользователь может задавать вопросы и получать ответы на основе Wiki,
-    памяти и read-only доступа к файловой системе. Для правок кода
-    используется отдельная ветка CODE_TASK (агентный луп).
+    Прямое редактирование кода ЗАПРЕЩЕНО. Для правок кода используется
+    отдельная ветка CODE_TASK (агентный луп).
     """
     llm = get_pro_llm().bind_tools(qa_readonly_tools)
     profile = state.get("user_profile") or ""
     wiki_context = read_all_wiki()
     memory_context = read_all_memory()
     goals = state.get("extracted_goals")
+
+    # Загружаем историю последних 3 сообщений пользователя.
+    chat_id = _active_chat_id
+    history_context = format_history_for_prompt(chat_id) if chat_id else ""
 
     sys_msg = SystemMessage(
         content=(
@@ -307,11 +315,12 @@ async def qa_pro_node(state: AgentState) -> dict:
             f"User profile:\n{profile}\n\n"
             f"Wiki Knowledge Base:\n{wiki_context}\n\n"
             f"Personal Memory (копия пользователя):\n{memory_context}\n\n"
+            f"{history_context}\n\n"
             "У тебя есть read-only доступ к файловой системе (read_file, list_directory). "
             "ВНИМАНИЕ: Прямое редактирование кода через write_file/edit/bash ЗАПРЕЩЕНО. "
-            "Если пользователь просит внести правки в код — скажи ему, что для этого "
+            "Если пользователь просит внести правки в код — скажи, что для этого "
             "нужно отправить запрос на модификацию, и он будет обработан через "
-            "агентный луп (Planner → Developer → Checker). "
+            "агентный луп (Orchestrator → Planner → Developer → Checker). "
             "Исключение — только .md-документация."
         )
     )
@@ -322,6 +331,11 @@ async def qa_pro_node(state: AgentState) -> dict:
     final_text = str(response.content) if response.content else ""
     if final_text and goals:
         final_text += f"\n\n---\n*🧠 [Обновлена память]: Я запомнил:*\n{goals}"
+
+    # Сохраняем пару user+assistant в историю (последние 3 пары).
+    user_msg = state["input_content"].strip()
+    if chat_id and final_text:
+        save_exchange(chat_id, user_msg, final_text)
 
     return {"messages": [response], "final_response": final_text}
 

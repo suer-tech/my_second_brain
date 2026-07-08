@@ -304,11 +304,13 @@ async def run_orchestrator(
     task: str,
     progress: Optional[ProgressCallback] = None,
 ) -> str:
-    """Оркестратор: координирует Planner → Developer → Checker с циклом.
+    """Оркестратор — LLM-агент, руководящий Planner/Developer/Checker.
 
-    Принимает опциональный progress-колбэк. Если не передан — использует
-    модульный глобал _active_progress (устанавливается из handlers.py).
-    Возвращает финальный отчёт с tool-статистикой.
+    Это полноценный LLM-агент с ReAct-циклом. Sub-agents (Planner, Developer,
+    Checker) вызываются как инструменты. Оркестратор сам решает:
+      - когда вызвать каждого агента
+      - нужно ли повторять цикл Developer→Checker после неудачных тестов
+      - когда задача завершена и пора сформировать финальный отчёт
     """
     if progress is None:
         progress = _active_progress
@@ -318,39 +320,117 @@ async def run_orchestrator(
 
     tool_counter: Counter = Counter()
 
+    # Общее состояние между Orchestrator и sub-agents.
+    shared = {"plan_path": "", "feedback": None, "success": False, "iterations": 0}
+
     if progress:
         await progress("🚀 Orchestrator", f"Запускаю пайплайн. Задача: {task[:120]}")
 
     logger.info("Orchestrator: сессия %s, задача: %s", session_dir, task[:200])
 
-    # Snapshot git ДО задачи.
+    # ─── Sub-agent tools для Orchestrator ──────────────────────────────
+
+    from langchain_core.tools import tool as tool_decorator
+
+    @tool_decorator
+    async def call_planner() -> str:
+        """Вызвать Planner агента: анализирует задачу, изучает код, составляет план в plan.md.
+        Вызывай ПЕРВЫМ, до Developer и Checker."""
+        if progress:
+            await progress(
+                "📋 Planner", "Анализирую задачу, изучаю код проекта, составляю план..."
+            )
+        plan_path = await run_planner(task, session_dir, progress, tool_counter)
+        shared["plan_path"] = plan_path
+        if progress:
+            await progress("📋 Planner", f"План готов: {plan_path}")
+        return f"План создан и сохранён: {plan_path}"
+
+    @tool_decorator
+    async def call_developer(feedback: str = "") -> str:
+        """Вызвать Developer агента: вносит правки в код согласно плану.
+        Аргумент feedback передай, если Checker нашёл ошибки (TESTS_FAILED).
+        Вызывай ПОСЛЕ Planner и после каждого провала тестов."""
+        shared["iterations"] += 1
+        detail = (
+            "Вношу правки в код по плану..."
+            if not feedback
+            else "Исправляю ошибки по feedback..."
+        )
+        if progress:
+            await progress("👨‍💻 Developer", detail)
+        report = await run_developer(
+            task, shared["plan_path"], feedback or None, progress, tool_counter
+        )
+        if progress:
+            await progress("👨‍💻 Developer", f"Завершил: {report[:150]}")
+        return report
+
+    @tool_decorator
+    async def call_checker() -> str:
+        """Вызвать Checker агента: пишет тесты, тестирует код.
+        Возвращает 'TESTS_PASSED' или 'TESTS_FAILED: ...'.
+        Вызывай ПОСЛЕ Developer."""
+        if progress:
+            await progress("🧪 Checker", "Пишу тесты и запускаю их...")
+        success, feedback = await run_checker(
+            task, shared["plan_path"], progress, tool_counter
+        )
+        shared["feedback"] = feedback
+        shared["success"] = success
+        if success:
+            if progress:
+                await progress("🧪 Checker", "✅ Все тесты пройдены")
+            return "TESTS_PASSED"
+        else:
+            if progress:
+                await progress("🧪 Checker", "❌ Тесты упали, нужно доработать")
+            return f"TESTS_FAILED: {feedback}"
+
+    orchestrator_tools = [call_planner, call_developer, call_checker]
+
+    # ─── Git snapshot ДО ───────────────────────────────────────────────
+
     git_before = await capture_git_snapshot()
 
-    # Шаг 1: Planner
-    plan_path = await run_planner(task, session_dir, progress, tool_counter)
+    # ─── Orchestrator LLM ReAct-цикл ────────────────────────────────────
 
-    # Шаг 2-3: Developer → Checker (цикл)
-    feedback: Optional[str] = None
-    dev_report = ""
-    checker_feedback = ""
-    success = False
-    iterations_used = 0
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        iterations_used = iteration
-        logger.info("Orchestrator: итерация %d", iteration)
+    llm = get_pro_llm()
 
-        dev_report = await run_developer(
-            task, plan_path, feedback, progress, tool_counter
-        )
-        success, checker_feedback = await run_checker(
-            task, plan_path, progress, tool_counter
-        )
+    system_prompt = (
+        "Ты — Orchestrator агент. Ты руководишь процессом модификации кода. "
+        "У тебя есть три подчинённых агента, вызываемых как инструменты:\n\n"
+        "1. call_planner — анализирует задачу, изучает код, составляет план\n"
+        "2. call_developer — следует плану, вносит правки в код\n"
+        "3. call_checker — пишет тесты, тестирует код\n\n"
+        "АЛГОРИТМ:\n"
+        "1. Сначала вызови call_planner\n"
+        "2. Затем call_developer\n"
+        "3. Затем call_checker\n"
+        "4. Если checker вернул TESTS_FAILED — вызови call_developer снова, "
+        "передав feedback из ответа checker\n"
+        "5. Повторяй цикл Developer→Checker пока тесты не пройдут "
+        "(максимум 3 полные итерации)\n"
+        "6. Когда checker вернёт TESTS_PASSED (или после 3 неудач) — "
+        "сформируй финальный отчёт для пользователя\n\n"
+        "ВАЖНО: Ты сам принимаешь решения. Анализируй результат каждого агента. "
+        "Если Developer сообщает об ошибке, передай это в feedback для следующей итерации."
+    )
 
-        if success:
-            break
-        feedback = checker_feedback
+    # Макс. итераций: planner(1) + 3×(developer+checker)(6) + final(1) = 8, берём 12.
+    MAX_ORCHESTRATOR_ITERS = 12
 
-    # Docs Sync
+    orch_result = await _run_with_tools(
+        llm,
+        system_prompt,
+        f"Задача пользователя: {task}",
+        orchestrator_tools,
+        tool_counter,
+        max_iters=MAX_ORCHESTRATOR_ITERS,
+    )
+
+    # ─── Docs Sync ─────────────────────────────────────────────────────
+
     docs_report = ""
     try:
         changed = await get_task_changed_files(git_before)
@@ -370,17 +450,17 @@ async def run_orchestrator(
     except Exception as e:
         logger.warning("Docs sync failed: %s", e)
 
-    # Статистика тулов
+    # ─── Финальный отчёт ────────────────────────────────────────────────
+
     stats = _format_tool_stats(tool_counter)
 
-    # Финальный ответ
-    if success:
+    if shared["success"]:
         result = (
             f"✅ **Задача выполнена успешно!**\n\n"
             f"Сессия: `{session_dir}`\n"
-            f"План: {plan_path}\n"
-            f"Итераций: {iterations_used}\n\n"
-            f"Отчёт разработчика:\n{dev_report[:500]}\n\n"
+            f"План: {shared['plan_path']}\n"
+            f"Итераций: {shared['iterations']}\n\n"
+            f"Отчёт Orchestrator:\n{orch_result[:600]}\n\n"
             f"{stats}"
             f"{docs_report}"
         )
@@ -388,9 +468,8 @@ async def run_orchestrator(
         result = (
             f"⚠️ **Не удалось выполнить задачу за {MAX_ITERATIONS} итераций.**\n\n"
             f"Сессия: `{session_dir}`\n"
-            f"План: {plan_path}\n\n"
-            f"Последний отчёт разработчика:\n{dev_report[:500]}\n\n"
-            f"Feedback тестировщика:\n{checker_feedback[:500]}\n\n"
+            f"План: {shared['plan_path']}\n\n"
+            f"Отчёт Orchestrator:\n{orch_result[:600]}\n\n"
             f"{stats}"
             f"{docs_report}"
         )
@@ -398,7 +477,7 @@ async def run_orchestrator(
     if progress:
         await progress(
             "🏁 Orchestrator",
-            f"Пайплайн завершён. Итераций: {iterations_used}, тулов: {sum(tool_counter.values())}",
+            f"Пайплайн завершён. Итераций: {shared['iterations']}, тулов: {sum(tool_counter.values())}",
         )
 
     return result

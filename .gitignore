@@ -12,6 +12,7 @@ raw/*.txt
 wiki/Article_*.md
 schema/index.json
 sessions/
+history/
 
 # Python
 __pycache__/

@@ -93,11 +93,12 @@ async def process_message(message: types.Message):
         except Exception:
             pass
 
-    # Пробрасываем колбэк в code_loop через модульный глобал (single-user бот,
-    # конкурентных запросов нет, поэтому thread-безопасность не нужна).
+    # Пробрасываем колбэк и chat_id через модульные глобалы (single-user бот).
     from src.agent import code_loop
+    from src.agent import graph as graph_module
 
     code_loop._active_progress = send_progress
+    graph_module._active_chat_id = message.chat.id
     try:
         result = await graph.ainvoke(
             {"input_content": text},
@@ -122,3 +123,4 @@ async def process_message(message: types.Message):
         )
     finally:
         code_loop._active_progress = None
+        graph_module._active_chat_id = None
