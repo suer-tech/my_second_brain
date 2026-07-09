@@ -37,6 +37,10 @@ wheels/
 .installed.cfg
 *.egg
 
+# IDE
+.idea/
+.vscode/
+
 # OS Files
 .DS_Store
 Thumbs.db

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import re
+import tempfile
 from langchain_core.tools import tool
 from src.agent.security import review_bash_command
 from src.agent.logger import log_tool_call, get_session_id, _now_ms as _log_now_ms
@@ -348,8 +349,82 @@ async def search_content(pattern: str, path: str = ".", include: str = "") -> st
     return result
 
 
+@tool
+async def apply_patch(diff: str) -> str:
+    """Apply a unified diff patch to the codebase. Use this INSTEAD of write_file when modifying existing files.
+    
+    Generate a diff in unified format (like `git diff` output) describing ONLY the lines to change.
+    The tool validates the patch against the current file state — if the context doesn't match,
+    the patch is rejected, preventing accidental data loss.
+    
+    Args:
+        diff: The unified diff content. Example:
+            --- a/src/file.py
+            +++ b/src/file.py
+            @@ -10,3 +10,5 @@
+             old line
+            +new line
+    """
+    t0 = _log_now_ms()
+    session_id = get_session_id() or ""
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".diff", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(diff)
+        patch_path = f.name
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f'git apply --unidiff-zero "{patch_path}"',
+            cwd=ROOT_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=30
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            result = "Error: patch apply timed out."
+            if session_id:
+                log_tool_call(session_id, "apply_patch", diff[:200], "timeout", _log_now_ms() - t0, result_summary=result)
+            return result
+
+        stderr = stderr_bytes.decode("utf-8", errors="ignore")
+        if proc.returncode != 0:
+            result = f"Patch rejected:\n{stderr}"
+            if session_id:
+                log_tool_call(session_id, "apply_patch", diff[:200], "rejected", _log_now_ms() - t0, result_summary=result[:200])
+            return result
+
+        result = "Patch applied successfully."
+        if session_id:
+            log_tool_call(session_id, "apply_patch", diff[:200], "ok", _log_now_ms() - t0, result_summary=result)
+        return result
+    except Exception as e:
+        result = f"Error applying patch: {str(e)}"
+        if session_id:
+            log_tool_call(session_id, "apply_patch", diff[:200], "error", _log_now_ms() - t0, result_summary=result[:200])
+        return result
+    finally:
+        try:
+            os.unlink(patch_path)
+        except OSError:
+            pass
+
+
 # Экспортируем список для LangGraph
-developer_tools = [execute_bash_command, read_file, write_file, list_directory, search_content]
+developer_tools = [
+    execute_bash_command,
+    read_file,
+    write_file,
+    apply_patch,
+    list_directory,
+    search_content,
+]
 
 # Read-only tools для Q&A-ветки: прямой запуск/редактирование кода запрещён,
 # но агент может читать файлы и листать директории для контекста.
