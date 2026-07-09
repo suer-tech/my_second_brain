@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _run_skill(task: str, skill: BaseSkill, context: SkillContext) -> str:
-    return await skill.execute(task, context)
+    if context.progress:
+        await context.progress(f"🤖 → {skill.name}", task[:120])
+    result = await skill.execute(task, context)
+    if context.progress:
+        await context.progress(f"✓ {skill.name}", "готово")
+    return result
 
 
 class MetaOrchestrator:
@@ -31,6 +36,9 @@ class MetaOrchestrator:
 
         llm = get_pro_llm()
 
+        if context.progress:
+            await context.progress("🧠 MetaOrchestrator", "анализирую запрос...")
+
         result = await _run_with_tools(
             llm,
             system_prompt,
@@ -45,7 +53,6 @@ class MetaOrchestrator:
         return result
 
     def _build_tools(self, context: SkillContext) -> list:
-        """Собирает инструменты: скиллы из реестра + общие read-only."""
         tools = []
 
         for skill in get_all_skills().values():
