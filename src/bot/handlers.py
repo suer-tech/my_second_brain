@@ -92,8 +92,7 @@ async def process_message(message: types.Message):
     # Отправляем сообщение-плейсхолдер
     processing_msg = await message.answer("Принято! Обрабатываю граф...")
 
-    # Progress callback: редактирует то же самое processing_msg,
-    # чтобы не плодить кучу отдельных сообщений (фикс дублирования).
+    # Progress callback: редактирует то же самое processing_msg.
     async def send_progress(step: str, detail: str):
         try:
             await processing_msg.edit_text(
@@ -102,11 +101,18 @@ async def process_message(message: types.Message):
         except Exception:
             pass
 
+    # Собираем шаги для итогового отчёта.
+    log_steps: list[str] = []
+
+    async def send_progress_with_log(step: str, detail: str):
+        log_steps.append(f"• <b>{step}</b>: {detail}")
+        await send_progress(step, detail)
+
     # Пробрасываем колбэк и chat_id через модульные глобалы (single-user бот).
     from src.agent import code_loop
     from src.agent import graph as graph_module
 
-    code_loop._active_progress = send_progress
+    code_loop._active_progress = send_progress_with_log
     graph_module._active_chat_id = message.chat.id
     try:
         result = await graph.ainvoke(
@@ -117,11 +123,27 @@ async def process_message(message: types.Message):
         final_response = result.get(
             "final_response", "Граф отработал, но ответ не сформирован."
         )
-        # Делим на части по 4000 символов (лимит Telegram).
-        chunks = [final_response[i:i+4000] for i in range(0, len(final_response), 4000)]
-        await processing_msg.edit_text(chunks[0])
-        for chunk in chunks[1:]:
+
+        # Формируем итоговый отчёт сессии.
+        session_summary = (
+            f"📋 <b>Отчёт сессии</b>\n\n"
+            f"<b>Запрос:</b> {text[:200]}\n"
+        )
+        if log_steps:
+            session_summary += "\n<b>Что сделано:</b>\n" + "\n".join(log_steps[-8:])
+        session_summary += f"\n\n<b>Результат:</b>\n{final_response[:3500]}"
+
+        # Отправляем итоговый отчёт отдельным сообщением.
+        summary_chunks = [session_summary[i:i+4000] for i in range(0, len(session_summary), 4000)]
+        await message.answer(summary_chunks[0], parse_mode=ParseMode.HTML)
+        for chunk in summary_chunks[1:]:
             await message.answer(chunk)
+
+        # Показываем последний шаг прогресса (не затираем его).
+        await processing_msg.edit_text(
+            "✅ <b>Обработка завершена</b>\nОтчёт отправлен выше.",
+            parse_mode=ParseMode.HTML,
+        )
 
     except GraphRecursionError:
         logger.warning("Graph recursion limit reached for input: %s", text[:200])
