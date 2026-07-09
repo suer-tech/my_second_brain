@@ -125,7 +125,7 @@ class UnifiedLLM:
 
     async def ainvoke(self, messages, **kwargs):
         messages = list(messages)
-        session_id = get_session_id() or ""
+        session_id = get_session_id() or "unknown"
         t0 = _log_now_ms()
 
         prompt_len = sum(len(str(m.content)) for m in messages)
@@ -135,28 +135,26 @@ class UnifiedLLM:
             llm = _get_routerai_llm().bind_tools(self._tools)
             result = await llm.ainvoke(messages)
             response_len = len(str(result.content))
-            if session_id:
-                log_llm_call(
-                    session_id,
-                    ROUTERAI_MODEL,
-                    prompt_len,
-                    response_len,
-                    _log_now_ms() - t0,
-                )
+            log_llm_call(
+                session_id,
+                ROUTERAI_MODEL,
+                prompt_len,
+                response_len,
+                _log_now_ms() - t0,
+            )
             return result
 
         # Без инструментов: сначала opencode CLI.
         try:
             content = await _call_opencode(messages)
             response_len = len(content)
-            if session_id:
-                log_llm_call(
-                    session_id,
-                    OPENCODE_MODEL,
-                    prompt_len,
-                    response_len,
-                    _log_now_ms() - t0,
-                )
+            log_llm_call(
+                session_id,
+                OPENCODE_MODEL,
+                prompt_len,
+                response_len,
+                _log_now_ms() - t0,
+            )
             return AIMessage(content=content)
         except Exception as e:
             logger.warning("opencode CLI недоступен, откат на router_ai: %s", e)
@@ -165,10 +163,9 @@ class UnifiedLLM:
         llm = _get_routerai_llm()
         result = await llm.ainvoke(messages)
         response_len = len(str(result.content))
-        if session_id:
-            log_llm_call(
-                session_id, ROUTERAI_MODEL, prompt_len, response_len, _log_now_ms() - t0
-            )
+        log_llm_call(
+            session_id, ROUTERAI_MODEL, prompt_len, response_len, _log_now_ms() - t0
+        )
         return result
 
 

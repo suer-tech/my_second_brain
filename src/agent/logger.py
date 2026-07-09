@@ -4,6 +4,7 @@
 Файл: logs/{session_id}.jsonl
 """
 
+import contextvars
 import json
 import os
 import time
@@ -15,9 +16,11 @@ LOG_DIR = os.path.join(
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Модульный глобал: session_id текущего выполнения. Устанавливается из handlers.py
-# перед вызовом графа, аналогично _active_chat_id и _active_progress.
-_active_session_id: Optional[str] = None
+# Контекстная переменная: свой session_id для каждого asyncio.Task.
+# Устанавливается из handlers.py перед вызовом графа.
+_active_session_id: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("_active_session_id", default=None)
+)
 
 
 def _now_ms() -> int:
@@ -57,12 +60,11 @@ def _log_event(
 
 
 def set_session_id(session_id: str) -> None:
-    global _active_session_id
-    _active_session_id = session_id
+    _active_session_id.set(session_id)
 
 
 def get_session_id() -> Optional[str]:
-    return _active_session_id
+    return _active_session_id.get()
 
 
 def log_node_start(

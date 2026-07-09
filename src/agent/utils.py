@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import uuid
 from typing import Optional
 
@@ -53,6 +54,48 @@ def update_user_profile(new_goals: str) -> None:
         header = "# Профиль пользователя и Карта знаний (Knowledge Map)\n\n"
     with open(profile_path, "a", encoding="utf-8") as f:
         f.write(f"{header}## Дополнения к профилю (Опыт и Цели)\n{new_goals}\n")
+
+
+def read_schema_catalog(max_chars: int = WIKI_CONTEXT_MAX_CHARS) -> str:
+    """Читает schema/index.json и возвращает каталог статей для промпта LLM.
+
+    Вместо полного содержимого всех wiki-файлов отдаёт компактный каталог:
+    заголовки, теги, краткое описание. LLM может затем прочитать нужную
+    статью через read_file.
+    """
+    schema_path = os.path.join(BASE_DIR, "schema", "index.json")
+    if not os.path.exists(schema_path):
+        return ""
+
+    try:
+        with open(schema_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+    articles = index.get("articles", [])
+    if not articles:
+        return ""
+
+    lines = ["--- Каталог Wiki (schema/index.json) ---"]
+    for art in articles:
+        title = art.get("title", "—")
+        tags = ", ".join(art.get("tags", []))
+        summary = (art.get("summary") or "")[:200]
+        wiki_file = art.get("wiki_file", "")
+        source = art.get("source_url") or ""
+        lines.append(f"\n[{title}]({wiki_file})")
+        if tags:
+            lines.append(f"  теги: {tags}")
+        if summary:
+            lines.append(f"  {summary}")
+        if source:
+            lines.append(f"  источник: {source}")
+
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit("\n", 1)[0] + "\n… [каталог обрезан]"
+    return result
 
 
 def read_all_wiki(max_chars: int = WIKI_CONTEXT_MAX_CHARS) -> str:

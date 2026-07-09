@@ -11,6 +11,11 @@ graph TD
     Index --> Rules[AGENT_RULES.md]
     Index --> Schema[DATA_SCHEMA.md]
     Arch --> Code[Исходный код /src]
+    Arch --> Meta[MetaOrchestrator src/agent/meta_orchestrator.py]
+    Meta --> Skills[Система скиллов src/agent/skills/]
+    Skills --> CodeEditor[CodeEditorSkill]
+    Skills --> Ingest[IngestSkill]
+    Skills --> Future[Будущие скиллы]
     Rules --> Claude[CLAUDE.md]
     Schema --> Storage[Хранилище: raw/ wiki/ schema/ memory/]
 ```

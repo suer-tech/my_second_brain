@@ -8,7 +8,7 @@
 
 ## Технологический Стек
 1. **Интерфейс**: Telegram Bot API, библиотека `aiogram` (v3.29+). Асинхронная обработка сообщений.
-2. **Оркестрация**: `LangGraph`. Используется для управления логическими цепочками (StateGraph): классификация намерения → извлечение данных → компиляция статьи → сохранение в Wiki.
+2. **Оркестрация**: `LangGraph`. Единственный узел `meta_orchestrator` с ReAct-циклом, который через LLM выбирает и вызывает зарегистрированные скиллы.
 3. **LLM-провайдеры** — двухуровневая схема с отказоустойчивостью:
    - **Основной — opencode CLI** (`opencode/deepseek-v4-flash-free`, бесплатный DeepSeek V4 Flash). Вызывается через `asyncio.create_subprocess_exec` с флагом `--format json`, вывод парсится как JSONL-поток событий.
    - **Резервный — router_ai** (`https://routerai.ru/api/v1`, OpenAI-совместимый API, модель `deepseek/deepseek-v4-flash`). Используется автоматически при недоступности opencode CLI, а также для всех вызовов с tool-calling (ReAct-цикл), т.к. opencode через subprocess не поддерживает итеративный вызов инструментов.
@@ -21,21 +21,30 @@
 ## Поток данных (Data Flow)
 1. Пользователь присылает ссылку/текст/команду в Telegram.
 2. `aiogram` хендлер перехватывает сообщение, валидирует `ALLOWED_TELEGRAM_ID` и инициирует LangGraph задачу.
-3. Узел `analyze_context` читает профиль пользователя и **классифицирует намерение** через LLM: `INGEST` (статья/ссылка), `QA` (вопрос) или `CODE_TASK` (модификация кода). Условное ребро `route_intent` направляет в соответствующую ветку.
-4. **Ветка Ingest** (`save_raw` → `extract_flash` → `compile_pro` → END):
-   - `save_raw`: асинхронно (aiohttp) скачивает контент по URL, сохраняет оригинал в `raw/`.
-   - `extract_flash`: LLM извлекает факты + теги (JSON).
-   - `compile_pro`: LLM формирует Markdown-статью, сохраняет в `wiki/`, регистрирует в `schema/index.json` с перекрёстными ссылками.
-5. **Ветка QA** (`update_memory` → `qa_pro` ↔ `qa_tools` → END):
-   - `update_memory`: LLM извлекает личные данные и категоризует в `memory/`.
-   - `qa_pro`: LLM с **read-only tools** (read_file, list_directory) отвечает на основе Wiki + памяти. **Прямое редактирование кода через write_file/edit/bash ЗАПРЕЩЕНО**.
-6. **Ветка CODE_TASK** (`orchestrator` → END):
-   - Запускается агентный луп из `src/agent/code_loop.py`.
-   - **Orchestrator** координирует цикл: Planner → Developer → Checker.
-   - **Planner**: изучает задачу, составляет план, сохраняет в `sessions/{id}/plan.md`.
-   - **Developer**: следует плану, вносит правки в код через tools (write_file, bash и т.д.).
-   - **Checker**: пишет тесты, тестирует код. Если тесты упали — цикл повторяется (Developer → Checker).
-   - Максимум 3 итерации, после чего возвращается отчёт.
+3. LangGraph запускает единственный узел `meta_orchestrator`:
+   - **MetaOrchestrator** (`src/agent/meta_orchestrator.py`) — LLM-агент с ReAct-циклом
+   - Видит все зарегистрированные скиллы как инструменты (code_editor, ingest и др.)
+   - Видит read-only инструменты (read_file, search_content, list_directory)
+   - Имеет контекст: профиль пользователя, Wiki-каталог, заметки
+   - **Сам принимает решение**, какой инструмент вызвать, без классификатора
+4. **Если выбран скилл code_editor**:
+   - Исполняется `CodeEditorSkill` из `src/agent/skills/code_editor.py`
+   - **Orchestrator** координирует цикл: Planner → Developer → Checker
+   - **Planner**: изучает задачу, составляет план, сохраняет в `sessions/{id}/plan.md`
+   - **Developer**: следует плану, вносит правки в код через tools
+   - **Checker**: пишет тесты, тестирует код. Если тесты упали — цикл повторяется
+   - После успеха — Docs Sync (актуализация документации)
+   - Генерируется финальный отчёт
+5. **Если выбран скилл ingest**:
+   - Исполняется `IngestSkill` из `src/agent/skills/ingest.py`
+   - Загружает контент по URL (или использует текст напрямую)
+   - Сохраняет оригинал в `raw/`
+   - Flash LLM извлекает факты + теги
+   - Pro LLM компилирует Markdown-статью, сохраняет в `wiki/`
+   - Регистрирует в `schema/index.json` с перекрёстными ссылками
+6. **Если ни один скилл не выбран** (вопрос, разговор):
+   - MetaOrchestrator отвечает напрямую, используя read-only инструменты
+   - Контекст: Wiki-каталог, заметки о пользователе, профиль
 7. Пользователь уведомляется финальным ответом.
 
 ## Асинхронность и провайдеры LLM
@@ -47,41 +56,126 @@
 - Выполнение shell-команд в tools — `asyncio.create_subprocess_shell` с таймаутом.
 - Веб-поиск (DuckDuckGo) — `asyncio.to_thread`.
 
-## Агентный луп модификации кода
-Реализован в `src/agent/code_loop.py`. Используется, когда пользователь просит внести правки в код.
+## Система скиллов (Skills)
+
+Система скиллов — это плагинная архитектура для расширения возможностей агента.
+Каждый скилл — самодостаточный модуль, реализующий протокол `BaseSkill`.
+Скиллы автоматически подхватываются `MetaOrchestrator`.
+
+### Протокол BaseSkill
+
+Определён в `src/agent/skills/base.py`:
+
+- **`name: str`** — уникальное имя скилла
+- **`description: str`** — описание для MetaOrchestrator (LLM видит его при выборе инструмента)
+- **`async execute(task: str, context: SkillContext) -> str`** — точка входа
+
+`SkillContext` содержит:
+- `session_id` / `session_dir` — идентификатор сессии
+- `progress` — колбэк для отправки прогресса (Telegram)
+- `tool_counter` — счётчик использованных инструментов
+
+### MetaOrchestrator
+
+Реализован в `src/agent/meta_orchestrator.py`. Единственный узел графа LangGraph.
+
+```mermaid
+graph TD
+    User[Пользователь] --> MO[MetaOrchestrator]
+    MO -->|LLM выбирает| CE[CodeEditorSkill]
+    MO -->|LLM выбирает| IS[IngestSkill]
+    MO -->|LLM отвечает сам| RO[read_file / search / list_directory]
+    CE --> P[Planner] --> D[Developer] --> C[Checker]
+    C -->|TESTS_FAILED| D
+    C -->|TESTS_PASSED| DS[Docs Sync]
+    IS --> Fetch[Загрузка URL / текст]
+    Fetch --> Extract[Flash LLM: факты + теги]
+    Extract --> Compile[Pro LLM: статья в Wiki]
+```
+
+MetaOrchestrator работает так:
+1. Получает из реестра все зарегистрированные скиллы
+2. Оборачивает каждый в `StructuredTool` (name = skill.name, description = skill.description)
+3. Добавляет read-only инструменты (read_file, search_content, list_directory)
+4. Формирует системный промпт с контекстом (профиль, Wiki, память) и списком скиллов
+5. Запускает ReAct-цикл: LLM сам решает, какой инструмент вызвать
+
+Классификатор `analyze_context` и условный роутинг `route_intent` **удалены** —
+MetaOrchestrator сам анализирует запрос и выбирает действие.
+
+### CodeEditorSkill
+
+Реализован в `src/agent/skills/code_editor.py`. Инкапсулирует логику
+редактирования кода: Planner → Developer → Checker с циклом.
+Использует функции `run_planner`, `run_developer`, `run_checker` из `code_loop.py`.
+
+### IngestSkill
+
+Реализован в `src/agent/skills/ingest.py`. Инкапсулирует логику
+сохранения знаний: загрузка → извлечение фактов → компиляция статьи.
+
+### Реестр скиллов
+
+Реализован в `src/agent/skills/registry.py`. Функции:
+- `register_skill(skill)` — регистрирует скилл
+- `get_skill(name)` — получает скилл по имени
+- `get_all_skills()` — возвращает все зарегистрированные скиллы
+
+Авторегистрация происходит при импорте пакета `src.agent.skills` (см. `__init__.py`).
+
+### Добавление нового скилла
+
+```python
+from src.agent.skills.base import BaseSkill, SkillContext
+
+class MySkill(BaseSkill):
+    name = "my_skill"
+    description = "Описание для LLM"
+
+    async def execute(self, task: str, context: SkillContext) -> str:
+        # логика скилла
+        return "результат"
+
+# регистрация (в src/agent/skills/__init__.py)
+from src.agent.skills.registry import register_skill
+register_skill(MySkill())
+```
+
+После регистрации MetaOrchestrator автоматически увидит новый скилл
+как доступный инструмент и сможет его вызвать.
+
+### CodeEditorSkill (внутренняя архитектура)
 
 ```
-Orchestrator
+CodeEditorSkill.execute
     │
     ├── git snapshot ДО (capture_git_snapshot)
     │
     ▼
-  Planner ──→ plan.md
+  call_planner ──→ plan.md
     │
     ▼
-  Developer ──→ правки в коде (через tools)
+  call_developer ──→ правки в коде (через tools)
     │
     ▼
-  Checker ──→ тесты
+  call_checker ──→ тесты
     │
-    ├── TESTS_PASSED ──→ Docs Sync ──→ результат пользователю
+    ├── TESTS_PASSED ──→ Docs Sync ──→ финальный отчёт
     │
-    └── TESTS_FAILED ──→ обратно к Developer (цикл, макс. 3 итерации)
+    └── TESTS_FAILED ──→ обратно к call_developer (цикл)
 ```
 
 **Актуализация документации (Docs Sync):**
-Реализована в `src/agent/docs_sync.py`. Запускается ПОСЛЕ завершения цикла Developer→Checker, но ДО ответа пользователю.
-1. Git snapshot ДО задачи сохраняется в начале orchestrator.
-2. После завершения задачи вычисляется `after \ before` — файлы, изменённые именно этой задачей.
-3. Если есть изменённые `.py` файлы → LLM (Documentation Sync Agent) анализирует их и релевантные `.md` в `docs/wiki/`, обновляет документацию через `write_file`.
-4. Защита от рекурсии: `.md`-файлы, изменённые sync-функцией, не триггерят повторный анализ исходного кода.
-5. Отчёт об актуализации включается в финальный ответ пользователю.
+Реализована в `src/agent/docs_sync.py`. Запускается внутри `CodeEditorSkill` после цикла Developer→Checker.
+1. Git snapshot ДО задачи сохраняется в начале `execute`.
+2. После завершения задачи вычисляется `after \ before` — файлы, изменённые задачей.
+3. Если есть изменённые `.py` файлы → LLM анализирует их и обновляет релевантную документацию.
+4. Защита от рекурсии: `.md`-файлы, изменённые sync-функцией, не триггерят повторный sync.
 
 **Правила безопасности:**
-- Прямое редактирование кода через `write_file`/`edit`/`bash` в Q&A-ветке **ЗАПРЕЩЕНО**.
-- Q&A-ветка имеет только read-only tools (`read_file`, `list_directory`).
-- Все правки кода идут исключительно через агентный луп (Developer agent).
-- Исключение — `.md`-документация (можно редактировать напрямую).
+- Прямое редактирование кода разрешено **только внутри** `CodeEditorSkill`.
+- MetaOrchestrator имеет только read-only инструменты для Q&A.
+- Любые правки кода идут исключительно через скилл `code_editor`.
 
 ## Ключевые сценарии использования (Use Cases)
 

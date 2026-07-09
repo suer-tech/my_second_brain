@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
 
 from src.agent.graph import build_graph, REACT_RECURSION_LIMIT
 from src.agent.utils import is_url
+from src.agent.logger import set_session_id
 
 router = Router()
 graph = build_graph()
@@ -83,13 +84,21 @@ async def process_message(message: types.Message):
 
     logger.info("Received message from %s: %s", _user_id(message), text)
 
+    # Генерируем UUID сессии для структурированного логирования.
+    import uuid as _uuid
+    session_id = _uuid.uuid4().hex[:12]
+    set_session_id(session_id)
+
     # Отправляем сообщение-плейсхолдер
     processing_msg = await message.answer("Принято! Обрабатываю граф...")
 
-    # Progress callback: отправляет отдельное сообщение при каждом переключении агента.
+    # Progress callback: редактирует то же самое processing_msg,
+    # чтобы не плодить кучу отдельных сообщений (фикс дублирования).
     async def send_progress(step: str, detail: str):
         try:
-            await message.answer(f"<b>{step}</b>\n{detail}", parse_mode=ParseMode.HTML)
+            await processing_msg.edit_text(
+                f"<b>{step}</b>\n{detail}", parse_mode=ParseMode.HTML
+            )
         except Exception:
             pass
 
@@ -108,7 +117,11 @@ async def process_message(message: types.Message):
         final_response = result.get(
             "final_response", "Граф отработал, но ответ не сформирован."
         )
-        await processing_msg.edit_text(final_response)
+        # Делим на части по 4000 символов (лимит Telegram).
+        chunks = [final_response[i:i+4000] for i in range(0, len(final_response), 4000)]
+        await processing_msg.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await message.answer(chunk)
 
     except GraphRecursionError:
         logger.warning("Graph recursion limit reached for input: %s", text[:200])
@@ -118,9 +131,11 @@ async def process_message(message: types.Message):
         )
     except Exception as e:
         logger.error("Error in graph execution: %s", e, exc_info=True)
-        await processing_msg.edit_text(
-            f"Произошла ошибка при выполнении графа: {str(e)}"
-        )
+        err_msg = f"Произошла ошибка при выполнении графа: {str(e)}"
+        if len(err_msg) > 4000:
+            err_msg = err_msg[:3997] + "..."
+        await processing_msg.edit_text(err_msg)
     finally:
         code_loop._active_progress = None
         graph_module._active_chat_id = None
+        set_session_id("")  # сбрасываем после обработки

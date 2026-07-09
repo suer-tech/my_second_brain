@@ -4,14 +4,14 @@ After=network.target
 
 [Service]
 # Бот будет работать от имени этого пользователя
-User=ai_agent
+User=user1
 Group=ai_agent
 
 # Укажи путь, куда ты склонировал репозиторий
-WorkingDirectory=/opt/my_agent
+WorkingDirectory=/opt/my_second_brain
 
-# Укажи путь к питону (рекомендуется использовать venv: /opt/my_agent/venv/bin/python)
-ExecStart=/usr/bin/python3 -m src.bot.main
+# Укажи путь к питону (рекомендуется использовать venv: /opt/my_second_brain/venv/bin/python)
+ExecStart=/opt/my_second_brain/venv/bin/python3 -m src.bot.main
 
 # Перезапуск при падении
 Restart=always

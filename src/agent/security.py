@@ -3,6 +3,7 @@ import asyncio
 from duckduckgo_search import DDGS
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.agent.llm_router import get_flash_llm
+from src.agent.prompt_loader import load_prompt
 
 
 def is_dangerous_command(command: str) -> bool:
@@ -89,19 +90,7 @@ async def review_bash_command(command: str) -> tuple[bool, str]:
         search_context += f"Web Search Results for package '{pkg}':\n{result}\n\n"
 
     llm = get_flash_llm()
-    sys_msg = SystemMessage(
-        content=(
-            "You are a strict Linux Security Supervisor Agent. Your job is to review a bash command "
-            "requested by an autonomous AI developer and decide if it is safe to execute on the host VPS.\n"
-            "RULES:\n"
-            "1. Block 'rm -rf /' or anything targeting root filesystem.\n"
-            "2. If it is installing a package (npm, pip, apt), check the provided Web Search Results for ANY signs of typosquatting, malware, or phishing.\n"
-            "3. If the package looks like a known malicious package, BLOCK IT.\n"
-            "4. If the command is generally safe (e.g. normal npm install express, or systemctl restart), ALLOW IT.\n\n"
-            "Output EXACTLY one word on the first line: 'ALLOW' or 'DENY'.\n"
-            "If 'DENY', output the reason on the second line."
-        )
-    )
+    sys_msg = SystemMessage(content=load_prompt("system/safety"))
 
     user_prompt = f"Command to review:\n{command}\n\nContext:\n{search_context}"
     user_msg = HumanMessage(content=user_prompt)

@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agent.llm_router import get_pro_llm
 from src.agent.tools import read_file
+from src.agent.prompt_loader import load_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -111,25 +112,7 @@ async def sync_documentation(changed_files: set[str]) -> Optional[str]:
     files_list = "\n".join(f"- {p}" for p in relevant_files)
     docs_list = "\n".join(f"- docs/wiki/{f}" for f in docs_files)
 
-    sys_msg = SystemMessage(
-        content=(
-            "Ты — Documentation Sync Agent. Твоя задача — актуализировать документацию "
-            "проекта после изменений в исходном коде.\n\n"
-            f"ИЗМЕНИВШИЕСЯ ФАЙЛЫ:\n{files_list}\n\n"
-            f"ДОСТУПНАЯ ДОКУМЕНТАЦИЯ:\n{docs_list}\n\n"
-            "АЛГОРИТМ:\n"
-            "1. Прочитай изменившиеся файлы (read_file), чтобы понять суть изменений.\n"
-            "2. Прочитай релевантные .md-файлы из docs/wiki/ (read_file).\n"
-            "3. Реши, нужно ли обновить документацию. Если да — обнови через write_file.\n"
-            "4. Если изменения не требуют обновления доки (например, рефакторинг без "
-            "изменения API) — ничего не делай.\n\n"
-            "ПРАВИЛА:\n"
-            "- Обновляй ТОЛЬКО файлы в docs/wiki/. Никогда не трогай исходный код.\n"
-            "- Сохраняй структуру и стиль существующей документации.\n"
-            "- Если обновил доку — верни краткий отчёт: какие файлы и что изменилось.\n"
-            "- Если обновление не требуется — верни ТОЛЬКО: NO_UPDATE_NEEDED"
-        )
-    )
+    sys_msg = SystemMessage(content=load_prompt("agents/docs_sync", files_list=files_list, docs_list=docs_list))
     user_msg = HumanMessage(
         content="Проанализируй изменения и актуализируй документацию."
     )
