@@ -1,9 +1,10 @@
 import logging
+import functools
 
 from langchain_core.tools import StructuredTool
 
 from src.agent.skills.registry import get_all_skills
-from src.agent.skills.base import SkillContext
+from src.agent.skills.base import SkillContext, BaseSkill
 from src.agent.code_loop import _run_with_tools, MAX_ORCHESTRATOR_ITERS
 from src.agent.llm_router import get_pro_llm
 from src.agent.prompt_loader import load_prompt
@@ -11,6 +12,10 @@ from src.agent.tools import read_file, write_file, search_content, list_director
 from src.agent.utils import read_user_profile, read_schema_catalog, read_all_memory
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_skill(task: str, skill: BaseSkill, context: SkillContext) -> str:
+    return await skill.execute(task, context)
 
 
 class MetaOrchestrator:
@@ -43,20 +48,15 @@ class MetaOrchestrator:
         """Собирает инструменты: скиллы из реестра + общие read-only."""
         tools = []
 
-        # Каждый зарегистрированный скилл — отдельный инструмент
         for skill in get_all_skills().values():
-
-            async def _execute(task: str) -> str:
-                return await skill.execute(task, context)
-
             t = StructuredTool.from_function(
-                func=_execute,
+                func=lambda _: "",
+                coroutine=functools.partial(_run_skill, skill=skill, context=context),
                 name=skill.name,
                 description=skill.description,
             )
             tools.append(t)
 
-        # Общие инструменты: полный доступ (bash, read/write, поиск)
         tools += [read_file, write_file, search_content, list_directory, execute_bash_command]
 
         return tools
