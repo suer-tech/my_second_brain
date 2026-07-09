@@ -29,7 +29,7 @@ class IngestSkill(BaseSkill):
         start_ms = log_node_start(session_id, "ingest", branch="ingest")
 
         if context.progress:
-            await context.progress("📥 Ingest", "Загружаю и анализирую контент...")
+            await context.progress("📥 Ingest", "загружаю и анализирую контент...")
 
         # ─── Шаг 1: загрузка ──────────────────────────────────────────────
 
@@ -44,9 +44,6 @@ class IngestSkill(BaseSkill):
             text = task
 
         raw_path = save_raw_file(text)
-
-        if context.progress:
-            await context.progress("📥 Ingest", "Контент загружен, извлекаю факты...")
 
         # ─── Шаг 2: извлечение фактов (Flash LLM) ─────────────────────────
 
@@ -75,7 +72,7 @@ class IngestSkill(BaseSkill):
             pass
 
         if context.progress:
-            await context.progress("📥 Ingest", f"Найдено тегов: {len(tags)}, компилирую статью...")
+            await context.progress("📥 Ingest", f"извлекаю факты ({len(tags)} тегов), компилирую статью...")
 
         # ─── Шаг 3: компиляция статьи (Pro LLM) ───────────────────────────
 

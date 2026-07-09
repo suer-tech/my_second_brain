@@ -44,7 +44,7 @@ class CodeEditorSkill(BaseSkill):
 
         if progress:
             await progress(
-                "🚀 Orchestrator", f"Запускаю пайплайн. Задача: {task[:120]}"
+                "🚀 code_editor", f"задача: {task[:120]}"
             )
 
         logger.info(
@@ -59,15 +59,13 @@ class CodeEditorSkill(BaseSkill):
             Вызывай ПЕРВЫМ, до Developer и Checker."""
             if progress:
                 await progress(
-                    "📋 Planner",
-                    "Анализирую задачу, изучаю код проекта, составляю план...",
+                    "📋 Planner →",
+                    "анализирую код и составляю план",
                 )
             plan_path = await run_planner(
                 task, session_dir, progress, tool_counter, session_id
             )
             shared["plan_path"] = plan_path
-            if progress:
-                await progress("📋 Planner", f"План готов: {plan_path}")
             return f"План создан и сохранён: {plan_path}"
 
         @tool_decorator
@@ -77,9 +75,9 @@ class CodeEditorSkill(BaseSkill):
             Вызывай ПОСЛЕ Planner и после каждого провала тестов."""
             shared["iterations"] += 1
             detail = (
-                "Вношу правки в код по плану..."
+                "← Planner, вношу правки"
                 if not feedback
-                else "Исправляю ошибки по feedback..."
+                else f"🔄 итерация {shared['iterations']}, исправляю: {feedback[:100]}"
             )
             if progress:
                 await progress("👨‍💻 Developer", detail)
@@ -91,8 +89,6 @@ class CodeEditorSkill(BaseSkill):
                 tool_counter,
                 session_id,
             )
-            if progress:
-                await progress("👨‍💻 Developer", f"Завершил: {report[:150]}")
             return report
 
         @tool_decorator
@@ -101,19 +97,18 @@ class CodeEditorSkill(BaseSkill):
             Возвращает 'TESTS_PASSED' или 'TESTS_FAILED: ...'.
             Вызывай ПОСЛЕ Developer."""
             if progress:
-                await progress("🧪 Checker", "Пишу тесты и запускаю их...")
+                await progress("🧪 Checker →", "← Developer, пишу тесты")
             success, feedback = await run_checker(
                 task, shared["plan_path"], progress, tool_counter, session_id
             )
             shared["feedback"] = feedback
             shared["success"] = success
+            if progress:
+                icon = "✅" if success else "❌"
+                await progress("🧪 Checker", f"{icon} {'пройдены' if success else 'упали → Developer'}")
             if success:
-                if progress:
-                    await progress("🧪 Checker", "✅ Все тесты пройдены")
                 return "TESTS_PASSED"
             else:
-                if progress:
-                    await progress("🧪 Checker", "❌ Тесты упали, нужно доработать")
                 return f"TESTS_FAILED: {feedback}"
 
         orchestrator_tools = [call_planner, call_developer, call_checker]
@@ -145,26 +140,11 @@ class CodeEditorSkill(BaseSkill):
         try:
             changed_files = await get_task_changed_files(git_before)
             if changed_files:
-                if progress:
-                    await progress(
-                        "📚 Docs Sync",
-                        f"Актуализирую документацию ({len(changed_files)} изм. файлов)...",
-                    )
                 sync_result = await sync_documentation(changed_files)
                 if sync_result:
                     docs_report = sync_result[:400]
-                if progress:
-                    await progress("📚 Docs Sync", "Готово")
         except Exception as e:
             logger.warning("Docs sync failed: %s", e)
-
-        # ─── Финальный отчёт через отдельный LLM-вызов ─────────────────────
-
-        if progress:
-            await progress(
-                "🧠 Orchestrator",
-                "Формирую итоговый ответ на основе результатов...",
-            )
 
         final_response = await _generate_final_summary(
             task=task,
@@ -178,8 +158,8 @@ class CodeEditorSkill(BaseSkill):
 
         if progress:
             await progress(
-                "🏁 Orchestrator",
-                f"Пайплайн завершён. Итераций: {shared['iterations']}, тулов: {sum(tool_counter.values())}",
+                "🏁 code_editor",
+                f"✅ итераций: {shared['iterations']}",
             )
 
         return final_response
