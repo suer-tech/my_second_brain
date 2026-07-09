@@ -124,26 +124,36 @@ async def process_message(message: types.Message):
             "final_response", "Граф отработал, но ответ не сформирован."
         )
 
-        # Формируем итоговый отчёт сессии.
-        session_summary = (
-            f"📋 <b>Отчёт сессии</b>\n\n"
-            f"<b>Запрос:</b> {text[:200]}\n"
+        # Если работал code_editor — показываем отчёт с шагами.
+        # Иначе — просто результат как обычное сообщение.
+        is_code_task = any(
+            kw in s for s in log_steps for kw in ("Planner", "Developer", "Checker")
         )
-        if log_steps:
-            session_summary += "\n<b>Что сделано:</b>\n" + "\n".join(log_steps[-8:])
-        session_summary += f"\n\n<b>Результат:</b>\n{final_response[:3500]}"
 
-        # Отправляем итоговый отчёт отдельным сообщением.
-        summary_chunks = [session_summary[i:i+4000] for i in range(0, len(session_summary), 4000)]
-        await message.answer(summary_chunks[0], parse_mode=ParseMode.HTML)
-        for chunk in summary_chunks[1:]:
-            await message.answer(chunk)
+        if is_code_task:
+            session_summary = (
+                f"📋 <b>Отчёт сессии</b>\n\n"
+                f"<b>Запрос:</b> {text[:200]}\n"
+            )
+            if log_steps:
+                session_summary += "\n<b>Что сделано:</b>\n" + "\n".join(log_steps[-8:])
+            session_summary += f"\n\n<b>Результат:</b>\n{final_response[:3500]}"
 
-        # Показываем последний шаг прогресса (не затираем его).
-        await processing_msg.edit_text(
-            "✅ <b>Обработка завершена</b>\nОтчёт отправлен выше.",
-            parse_mode=ParseMode.HTML,
-        )
+            summary_chunks = [session_summary[i:i+4000] for i in range(0, len(session_summary), 4000)]
+            await message.answer(summary_chunks[0], parse_mode=ParseMode.HTML)
+            for chunk in summary_chunks[1:]:
+                await message.answer(chunk)
+
+            await processing_msg.edit_text(
+                "✅ <b>Обработка завершена</b>\nОтчёт отправлен выше.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            # Простой ответ — отправляем как обычное сообщение.
+            chunks = [final_response[i:i+4000] for i in range(0, len(final_response), 4000)]
+            await processing_msg.edit_text(chunks[0])
+            for chunk in chunks[1:]:
+                await message.answer(chunk)
 
     except GraphRecursionError:
         logger.warning("Graph recursion limit reached for input: %s", text[:200])
